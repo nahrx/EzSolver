@@ -19,6 +19,7 @@ import platform
 import subprocess
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Optional
@@ -65,12 +66,18 @@ class PersistentSolver:
             fut = asyncio.run_coroutine_threadsafe(
                 self._solve_async(sitekey, siteurl, timeout), self._loop
             )
-            return fut.result(timeout=timeout + 10)
+            try:
+                return fut.result(timeout=timeout + 10)
+            except TimeoutError:
+                fut.cancel()
+                raise TimeoutError(
+                    f"browser did not finish solving within {timeout + 10}s"
+                )
 
     async def _solve_async(self, sitekey: str, siteurl: str, timeout: int) -> str:
         try:
             token = await solve_on_page(self._page, sitekey, siteurl, timeout)
-            await self._page.get("about:blank")
+            await asyncio.wait_for(self._page.get("about:blank"), 10)
             return token
         except Exception:
             # If the page or browser crashed, attempt recovery
@@ -175,8 +182,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"token": token, "elapsed": elapsed})
         except Exception as exc:
             elapsed = round(time.time() - t0, 2)
-            print(f"[service] error after {elapsed}s: {exc}")
-            self.send_json(500, {"error": str(exc)})
+            print(f"[service] error after {elapsed}s: {type(exc).__name__}: {exc!r}")
+            traceback.print_exc()
+            self.send_json(500, {"error": str(exc) or type(exc).__name__})
         finally:
             with _count_lock:
                 _active_count -= 1

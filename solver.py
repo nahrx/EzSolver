@@ -11,6 +11,7 @@ MADE BY ISMOILOFF. GOOD LUCK HAVE FUN, THIS IS JUST PROJECT, USE IT ON UR OWN RI
 
 """
 import nodriver as uc
+from nodriver import cdp
 
 # Performance and resource-saving flags for Chrome
 CHROME_ARGS = [
@@ -100,12 +101,52 @@ async def start_browser(profile_dir: Optional[str] = None) -> uc.Browser:
     )
 
 
+async def _aw(coro, seconds: float = 10):
+    """Await a CDP call with a hard deadline so one stalled browser reply cannot freeze the solve."""
+    try:
+        return await asyncio.wait_for(coro, seconds)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"browser did not respond within {seconds}s")
+
+
+async def _page_widget(page: uc.Tab) -> dict:
+    """State of the page's own Turnstile widget: {has: bool, token: str|None}."""
+    raw = await _aw(
+        page.evaluate(
+            """JSON.stringify((() => {
+                const i = document.querySelector('[name="cf-turnstile-response"]');
+                return i ? {has: true, token: i.value || null} : {has: false};
+            })())"""
+        )
+    )
+    return json.loads(raw) if raw and raw != 'null' else {}
+
+
 async def solve_on_page(page: uc.Tab, sitekey: str, siteurl: str, timeout: int = 45) -> str:
     """Solve Cloudflare Turnstile on a given page/tab."""
-    await page.get(siteurl)
+    # Turnstile stays dormant in an unfocused/hidden window; force focus before navigating.
+    for call in (cdp.page.bring_to_front(), cdp.emulation.set_focus_emulation_enabled(True)):
+        try:
+            await _aw(page.send(call), 5)
+        except Exception:
+            pass
+
+    await _aw(page.get(siteurl), timeout)
+
+    # Most target pages already render the widget — reuse its token before touching the DOM.
+    early_start = asyncio.get_event_loop().time()
+    early_deadline = early_start + min(20, timeout)
+    while asyncio.get_event_loop().time() < early_deadline:
+        state = await _page_widget(page)
+        if state.get("token"):
+            return state["token"]
+        # give the page a few seconds to mount its widget before rendering our own
+        if not state.get("has") and asyncio.get_event_loop().time() - early_start > 5:
+            break
+        await asyncio.sleep(0.5)
 
     # 1. Clean HTML, halt background network activity, and intercept attachShadow
-    await page.evaluate(f"""
+    await _aw(page.evaluate(f"""
         (() => {{
             window.stop();
             document.body.innerHTML = '';
@@ -138,10 +179,10 @@ async def solve_on_page(page: uc.Tab, sitekey: str, siteurl: str, timeout: int =
             s.async = true;
             document.head.appendChild(s);
         }})();
-    """)
+    """), timeout)
 
     async def get_state() -> dict:
-        raw = await page.evaluate("""
+        raw = await _aw(page.evaluate("""
             JSON.stringify((() => {
                 if (window._tsError) return {error: window._tsError};
                 if (window._tsToken) return {token: window._tsToken};
@@ -149,11 +190,11 @@ async def solve_on_page(page: uc.Tab, sitekey: str, siteurl: str, timeout: int =
                 if (inp && inp.value) return {token: inp.value};
                 return {};
             })())
-        """)
+        """), 10)
         return json.loads(raw) if raw and raw != 'null' else {}
 
     async def get_cf_iframe_rect() -> Optional[dict]:
-        raw = await page.evaluate("""
+        raw = await _aw(page.evaluate("""
             JSON.stringify((() => {
                 let f = null;
                 if (window._tsShadowRoot) {
@@ -171,7 +212,7 @@ async def solve_on_page(page: uc.Tab, sitekey: str, siteurl: str, timeout: int =
                 }
                 return null;
             })())
-        """)
+        """), 10)
         if raw and raw != 'null':
             return json.loads(raw)
         return None
@@ -185,11 +226,12 @@ async def solve_on_page(page: uc.Tab, sitekey: str, siteurl: str, timeout: int =
             cx = 20 + 28 + random.uniform(-3, 3)
             cy = 20 + 32 + random.uniform(-3, 3)
             print(f"[solver] clicking widget position ({cx:.0f}, {cy:.0f})")
-        await page.mouse_move(cx - 80, cy - 20)
+        # nodriver's multi-step mouse_move waits on 11 CDP acks and can stall for minutes
+        await _aw(page.mouse_move(cx - 80, cy - 20, steps=1), 10)
         await asyncio.sleep(random.uniform(0.15, 0.25))
-        await page.mouse_move(cx, cy)
+        await _aw(page.mouse_move(cx, cy, steps=1), 10)
         await asyncio.sleep(random.uniform(0.08, 0.15))
-        await page.mouse_click(cx, cy)
+        await _aw(page.mouse_click(cx, cy), 10)
 
     start_time = asyncio.get_event_loop().time()
     rect = None

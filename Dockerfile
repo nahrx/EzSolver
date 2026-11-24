@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir nodriver
+RUN pip install --no-cache-dir "nodriver==0.50.99"
 
 WORKDIR /app
 COPY solver.py service.py clientsend.py ./
