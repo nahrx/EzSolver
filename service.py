@@ -15,8 +15,6 @@ made by ismoiloff
 import asyncio
 import json
 import os
-import platform
-import subprocess
 import threading
 import time
 import traceback
@@ -79,17 +77,26 @@ class PersistentSolver:
             token = await solve_on_page(self._page, sitekey, siteurl, timeout)
             await asyncio.wait_for(self._page.get("about:blank"), 10)
             return token
-        except Exception:
-            # If the page or browser crashed, attempt recovery
-            try:
-                await self._page.get("about:blank")
-            except Exception:
-                try:
-                    self._browser.stop()
-                except Exception:
-                    pass
-                await self._init_browser()
+        except BaseException:
+            # Crashed or cancelled (outer timeout): recover on a separate task, since awaiting
+            # inside an already-cancelled coroutine raises again immediately.
+            asyncio.get_running_loop().create_task(self._recover())
             raise
+
+    async def _recover(self):
+        """Reset the tab, or restart Chrome when the page no longer answers CDP."""
+        assert self._page is not None and self._browser is not None
+        try:
+            await asyncio.wait_for(self._page.get("about:blank"), 10)
+        except BaseException:
+            try:
+                self._browser.stop()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(self._init_browser(), 30)
+            except Exception:
+                pass
 
     def stop(self):
         if self._browser:
@@ -107,23 +114,6 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle each request in its own thread so requests don't block socket acceptance."""
 
     daemon_threads = True
-
-
-def _ensure_display() -> Optional[subprocess.Popen]:
-    """On Linux headless servers, start a virtual display so Chrome can run."""
-    if platform.system() != "Linux":
-        return None
-    if os.environ.get("DISPLAY"):
-        return None
-    xvfb = subprocess.Popen(
-        ["Xvfb", ":99", "-screen", "0", "1024x768x16"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    os.environ["DISPLAY"] = ":99"
-    time.sleep(0.5)
-    print("[service] started Xvfb on :99")
-    return xvfb
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -205,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    xvfb_proc = _ensure_display()
+    xvfb_proc = _start_xvfb_if_needed()
     print("[service] initializing persistent Chrome browser...")
     _solver.start()
     server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
